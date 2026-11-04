@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="buy-sell-bot.client/buy-sell-bot.client.esproj">
+    <Build />
+    <Deploy />
+  </Project>
+  <Project Path="buy-sell-bot.Server/buy-sell-bot.Server.csproj" />
+</Solution>

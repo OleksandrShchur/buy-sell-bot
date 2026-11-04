@@ -1,0 +1,6 @@
+@buy_sell_bot.Server_HostAddress = http://localhost:5223
+
+GET {{buy_sell_bot.Server_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
