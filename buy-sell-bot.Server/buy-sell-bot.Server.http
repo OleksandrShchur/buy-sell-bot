@@ -1,6 +1,10 @@
 @buy_sell_bot.Server_HostAddress = http://localhost:5223
 
-GET {{buy_sell_bot.Server_HostAddress}}/weatherforecast/
+GET {{buy_sell_bot.Server_HostAddress}}/health
 Accept: application/json
+
+###
+
+HEAD {{buy_sell_bot.Server_HostAddress}}/health
 
 ###

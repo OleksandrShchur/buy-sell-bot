@@ -4,4 +4,5 @@
     <Deploy />
   </Project>
   <Project Path="buy-sell-bot.Server/buy-sell-bot.Server.csproj" />
+  <Project Path="buy-sell-bot.Tests/buy-sell-bot.Tests.csproj" />
 </Solution>
