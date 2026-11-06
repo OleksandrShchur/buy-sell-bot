@@ -1,2 +1,9 @@
 ﻿.vs
 buy-sell-bot.Server/obj
+artifacts
+buy-sell-bot.client/obj
+buy-sell-bot.Server/bin
+buy-sell-bot.Server/data
+buy-sell-bot.Server/Properties/PublishProfiles
+buy-sell-bot.Tests/bin
+buy-sell-bot.Tests/obj
