@@ -1,2 +1,15 @@
 ﻿.vs
 buy-sell-bot.Server/obj
+buy-sell-bot.client/obj
+**/bin/
+**/obj/
+**/*.user
+**/data/
+.env
+.env.*
+artifacts/
+TestResults/
+*.log
+buy-sell-bot.Server/Properties/PublishProfiles/site104867-WebDeploy.pubxml
+buy-sell-bot.Server/buy-sell-bot.Server.csproj.user
+buy-sell-bot.Server/appsettings.Development.json
