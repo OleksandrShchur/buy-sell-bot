@@ -9,6 +9,7 @@ using BuySellBot.Publishing;
 using BuySellBot.Storage;
 using Microsoft.Extensions.Options;
 using Telegram.Bot.Exceptions;
+using Telegram.Bot.Types;
 using Telegram.Bot.Types.ReplyMarkups;
 using T = BuySellBot.Texts.Texts;
 
@@ -16,7 +17,7 @@ namespace BuySellBot.Moderation;
 
 public sealed class ModerationService(
     ITelegramGateway telegram, IListingRepository listings, ISessionRepository sessions,
-    Publisher publisher, PostFormatter formatter, Catalog catalog, FlowEngine engine, BuilderUi ui,
+    Publisher publisher, PostFormatter formatter, Catalog catalog, FlowEngine engine, BuilderUi ui, ListingLocks locks,
     IOptions<BotOptions> options, ILogger<ModerationService> logger)
 {
     public bool IsAdmin(long userId) => options.Value.AdminIds.Contains(userId);
@@ -34,7 +35,7 @@ public sealed class ModerationService(
             try
             {
                 await telegram.SendPhotos(admin, listing.Photos, null, ct);
-                var text = CardText(listing);
+                var text = CardText(listing, admin);
                 var keyboard = CardKeyboard(listing, admin);
                 var id = await telegram.SendText(admin, text, keyboard, ct);
                 listing.ModerationCards.Add(new(admin, id, RenderHash(text, keyboard)));
@@ -44,7 +45,7 @@ public sealed class ModerationService(
             { logger.LogWarning("Admin {AdminId} must start or unblock the bot to receive moderation cards", admin); }
         }
     }
-    private string CardText(Listing listing)
+    private string CardText(Listing listing, long admin)
     {
         var author = $"<a href=\"tg://user?id={listing.AuthorUserId}\">{PostFormatter.Escape(listing.AuthorName)}</a>";
         if (listing.AuthorUsername is { Length: > 0 } username) author += " @" + PostFormatter.Escape(username);
@@ -56,7 +57,7 @@ public sealed class ModerationService(
             _ => listing.Operation switch
             {
                 ModerationOperation.Editing => T.Moderating,
-                ModerationOperation.Declining => T.Declining,
+                ModerationOperation.Declining => listing.ModeratorId == admin ? T.ChooseReason : T.Declining,
                 ModerationOperation.Publishing => T.Publishing,
                 ModerationOperation.Uncertain => T.UncertainStatus, _ => ""
             }
@@ -77,7 +78,7 @@ public sealed class ModerationService(
         for (var n = 0; n < listing.ModerationCards.Count; n++)
         {
             var card = listing.ModerationCards[n];
-            var text = CardText(listing);
+            var text = CardText(listing, card.AdminId);
             var keyboard = CardKeyboard(listing, card.AdminId);
             var hash = RenderHash(text, keyboard);
             if (hash == card.RenderHash) continue;
@@ -107,14 +108,7 @@ public sealed class ModerationService(
         if (data.Action == "reason")
         {
             if (!int.TryParse(data.Arg, out var index) || index < 0 || index >= T.DeclineReasons.Length) return;
-            listing.Status = ListingStatus.Declined;
-            listing.DeclineReason = T.DeclineReasons[index];
-            listing.Operation = ModerationOperation.None;
-            listing.AuthorNotified = false;
-            listing.Revision++; listing.UpdatedAt = DateTimeOffset.UtcNow;
-            await listings.Save(listing, ct);
-            await RefreshCards(listing, ct);
-            await NotifyAuthor(listing, ct);
+            await CompleteDecline(listing, T.DeclineReasons[index], ct);
             return;
         }
         if (data.Action == "edit" && await sessions.Get(admin, SessionMode.Moderator, ct) is not null)
@@ -164,6 +158,67 @@ public sealed class ModerationService(
         await sessions.Activate(admin, SessionMode.Moderator, ct);
         await ui.Render(session, copy, ct);
     }
+    public async Task<bool> TryHandleDeclineReason(Update update, CancellationToken ct)
+    {
+        if (update.Message is not { From: { } admin } message || !IsAdmin(admin.Id) ||
+            message.Text?.TrimStart().StartsWith('/') == true) return false;
+
+        var all = await listings.All(ct);
+        // Resume a failed delivery against the original listing if Telegram retries this input.
+        var target = all.FirstOrDefault(listing => listing.DeclineInputUpdateId == update.Id);
+        if (target is null)
+        {
+            var pending = all.Where(listing => listing.Status == ListingStatus.PendingApproval &&
+                listing.Operation == ModerationOperation.Declining && listing.ModeratorId == admin.Id).ToArray();
+            if (message.ReplyToMessage is { } reply)
+                target = pending.FirstOrDefault(listing => listing.ModerationCards.Any(card => card.AdminId == admin.Id && card.MessageId == reply.Id));
+            else if (pending.Length == 1) target = pending[0];
+            else if (pending.Length > 1)
+            {
+                await telegram.SendText(admin.Id, T.DeclineReplyRequired, null, ct);
+                return true;
+            }
+        }
+        if (target is null) return false;
+
+        using var lease = await locks.Acquire(target.Id, ct);
+        var current = await listings.Get(target.Id, ct);
+        if (current is null) return true;
+        if (current.DeclineInputUpdateId == update.Id)
+        {
+            if (current.Status == ListingStatus.Declined && current.ModeratorId == admin.Id)
+            {
+                await RefreshCards(current, ct);
+                await NotifyAuthor(current, ct);
+            }
+            return true;
+        }
+        if (current.Status != ListingStatus.PendingApproval || current.Operation != ModerationOperation.Declining || current.ModeratorId != admin.Id)
+        {
+            await telegram.SendText(admin.Id, T.Stale, null, ct);
+            return true;
+        }
+        var reason = message.Text?.Trim();
+        if (string.IsNullOrEmpty(reason) || reason.Length > 500 || reason.Any(c => char.IsControl(c) && c is not ('\n' or '\r' or '\t')))
+        {
+            await telegram.SendText(admin.Id, T.DeclineReasonError, null, ct);
+            return true;
+        }
+        current.DeclineInputUpdateId = update.Id;
+        await CompleteDecline(current, reason, ct);
+        return true;
+    }
+    private async Task CompleteDecline(Listing listing, string reason, CancellationToken ct)
+    {
+        listing.Status = ListingStatus.Declined;
+        listing.DeclineReason = reason;
+        listing.Operation = ModerationOperation.None;
+        listing.AuthorNotified = false;
+        listing.Revision++; listing.UpdatedAt = DateTimeOffset.UtcNow;
+        await listings.Save(listing, ct);
+        await RefreshCards(listing, ct);
+        await NotifyAuthor(listing, ct);
+    }
     public async Task Release(Listing listing, CancellationToken ct)
     {
         listing.Operation = ModerationOperation.None; listing.ModeratorId = null; listing.Revision++;
@@ -204,7 +259,7 @@ public sealed class ModerationService(
         }
         await ui.Cleanup(session, ct, keepPost: true);
         await sessions.Delete(session.UserId, SessionMode.Moderator, ct);
-        await telegram.Notify(session.UserId, T.PublishedStatus, new ReplyKeyboardRemove(), ct);
+        await telegram.Notify(session.UserId, T.PublishedStatus, BuilderRenderer.Menu, ct);
         await RefreshCards(copy, ct);
         await NotifyAuthor(copy, ct);
     }

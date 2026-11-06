@@ -24,7 +24,7 @@ public sealed class FlowTests
         bot.Engine.Skip(session, listing);
         Assert.Equal("contact", session.CurrentStepId);
         Assert.Null(listing.ContactKind);
-        bot.Engine.Apply(session, listing, new(Arg: "telegram"));
+        bot.Engine.Apply(session, listing, new(Arg: "share"));
         Assert.Equal(FlowEngine.Review, session.CurrentStepId);
         Assert.Equal(8, ProgressCalculator.Completed(session, bot.Engine.Steps));
         Assert.Contains("contact", session.CompletedSteps);
@@ -70,17 +70,19 @@ public sealed class FlowTests
     }
 
     [Fact]
-    public void PhotosAreDeduplicatedAndCapped()
+    public void PhotosAreDeduplicatedAndTheTenthPhotoAdvances()
     {
         using var bot = new BotFixture();
         var listing = bot.Listing();
         var session = new BuilderSession { CurrentStepId = "photos" };
-        for (var n = 0; n < 11; n++) bot.Engine.Apply(session, listing, new(Photo: new($"file{n}", $"unique{n}")));
-        Assert.Equal(10, listing.Photos.Count);
-        Assert.NotNull(session.Warning);
+        for (var n = 0; n < 9; n++) bot.Engine.Apply(session, listing, new(Photo: new($"file{n}", $"unique{n}")));
         bot.Engine.Apply(session, listing, new(Photo: new("different-size", "unique0")));
+        Assert.Equal(9, listing.Photos.Count);
+        Assert.Equal("photos", session.CurrentStepId);
+        bot.Engine.Apply(session, listing, new(Photo: new("file9", "unique9")));
         Assert.Equal(10, listing.Photos.Count);
-        bot.Engine.Apply(session, listing, new(Arg: "done"));
         Assert.Equal("location", session.CurrentStepId);
+        Assert.Null(session.Warning);
+        Assert.Contains("photos", session.CompletedSteps);
     }
 }

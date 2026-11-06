@@ -11,29 +11,25 @@ public sealed class BuilderUiTests
     private static CancellationToken Ct => CancellationToken.None;
 
     [Fact]
-    public async Task SingleStartButtonIsRemovedAndProductAndActionsAreSeparate()
+    public async Task BuyAndSellButtonsAreRemovedAndAnEmptyDraftShowsOnlyActions()
     {
         using var bot = new BotFixture();
         bot.Options.Value.ChatUrl = "https://t.me/test_community";
         await bot.Router.Handle(BotFixture.Message(10, "/start"), Ct);
         Assert.Contains("<a href=\"https://t.me/test_community\">у спільноті</a>", Assert.Single(bot.Telegram.SentMessages).Text);
         var menu = Assert.IsType<ReplyKeyboardMarkup>(bot.Telegram.LastReplyKeyboard);
-        Assert.Equal(T.CreateListing, Assert.Single(Assert.Single(menu.Keyboard)).Text);
-        await bot.Router.Handle(BotFixture.Message(10, T.CreateListing), Ct);
+        Assert.Equal(new[] { T.Buy, T.Sell }, menu.Keyboard.SelectMany(row => row).Select(button => button.Text));
+        await bot.Router.Handle(BotFixture.Message(10, T.Sell), Ct);
         var session = (await bot.Sessions.Get(10, SessionMode.Author, Ct))!;
         var listing = (await bot.Listings.Get(session.ListingId, Ct))!;
-        Assert.Equal(Intent.BuyOrSell, listing.Intent);
+        Assert.Equal(Intent.Sell, listing.Intent);
         Assert.Equal("category", session.CurrentStepId);
         Assert.IsType<ReplyKeyboardRemove>(bot.Telegram.LastReplyKeyboard);
-        var productId = Assert.Single(session.ProductMessageIds);
-        Assert.True(productId < session.BuilderMessageId);
-        var product = bot.Telegram.SentMessages.Single(m => m.Chat == 10 && m.Id == productId);
+        Assert.Empty(session.ProductMessageIds);
         var actions = bot.Telegram.SentMessages.Single(m => m.Chat == 10 && m.Id == session.BuilderMessageId);
-        Assert.Equal(T.PostPlaceholder, product.Text);
-        Assert.IsNotType<InlineKeyboardMarkup>(product.Keyboard);
+        Assert.Single(bot.Telegram.SentMessages, message => message.Chat == 10 && message.Text?.StartsWith(T.BuilderHeader, StringComparison.Ordinal) == true);
         Assert.Contains("Крок 1 з 8", actions.Text);
         Assert.Contains(T.CategoryPrompt, actions.Text);
-        Assert.DoesNotContain(T.PostPlaceholder, actions.Text);
         Assert.DoesNotContain("▰", actions.Text);
         Assert.DoesNotContain("▱", actions.Text);
         Assert.DoesNotContain("0/10", actions.Text);
@@ -46,11 +42,14 @@ public sealed class BuilderUiTests
     public async Task EnteringFieldsEditsTheSameProductAndActionsMessages()
     {
         using var bot = new BotFixture();
-        await bot.Router.Handle(BotFixture.Message(10, T.CreateListing), Ct);
+        await bot.Router.Handle(BotFixture.Message(10, T.Sell), Ct);
         var session = (await bot.Sessions.Get(10, SessionMode.Author, Ct))!;
+        var firstActionsId = session.BuilderMessageId!.Value;
+        await bot.Router.Handle(BotFixture.Callback(10, firstActionsId, new("choose", session.ListingId, session.Nonce, "0")), Ct);
+        session = (await bot.Sessions.Get(10, SessionMode.Author, Ct))!;
         var productId = Assert.Single(session.ProductMessageIds);
         var actionsId = session.BuilderMessageId!.Value;
-        await bot.Router.Handle(BotFixture.Callback(10, actionsId, new("choose", session.ListingId, session.Nonce, "0")), Ct);
+        Assert.True(productId < actionsId);
         await bot.Router.Handle(BotFixture.Message(10, "Велосипед для міста"), Ct);
         session = (await bot.Sessions.Get(10, SessionMode.Author, Ct))!;
         Assert.Equal(productId, Assert.Single(session.ProductMessageIds));
@@ -59,13 +58,76 @@ public sealed class BuilderUiTests
         var product = bot.Telegram.SentMessages.Single(m => m.Chat == 10 && m.Id == productId);
         var actions = bot.Telegram.SentMessages.Single(m => m.Chat == 10 && m.Id == actionsId);
         Assert.Contains("Велосипед для міста", product.Text);
-        Assert.Contains(T.ListingTag, product.Text);
+        Assert.Contains(T.SellTag, product.Text);
         Assert.DoesNotContain(T.SharedConditionPrompt, product.Text);
         Assert.DoesNotContain("@author", product.Text);
         Assert.DoesNotContain(T.ContactField + ":", product.Text);
         Assert.Contains("Крок 3 з 8", actions.Text);
         Assert.Contains(Assert.IsType<InlineKeyboardMarkup>(actions.Keyboard).InlineKeyboard.SelectMany(row => row), button => button.Text == T.Back);
         Assert.DoesNotContain("Велосипед для міста", actions.Text);
+    }
+
+    [Fact]
+    public async Task EmptyDraftValidationAndCancelKeepTheSameActionsWithoutCreatingAProduct()
+    {
+        using var bot = new BotFixture();
+        await bot.Router.Handle(BotFixture.Message(10, T.Sell), Ct);
+        var session = (await bot.Sessions.Get(10, SessionMode.Author, Ct))!;
+        var actionsId = session.BuilderMessageId!.Value;
+        await bot.Router.Handle(BotFixture.Message(10, "Некоректний ввід"), Ct);
+        session = (await bot.Sessions.Get(10, SessionMode.Author, Ct))!;
+        Assert.Empty(session.ProductMessageIds);
+        Assert.Equal(actionsId, session.BuilderMessageId);
+        await bot.Router.Handle(BotFixture.Callback(10, actionsId, new("cancel", session.ListingId, session.Nonce)), Ct);
+        session = (await bot.Sessions.Get(10, SessionMode.Author, Ct))!;
+        Assert.Empty(session.ProductMessageIds);
+        Assert.Equal(actionsId, session.BuilderMessageId);
+        Assert.Contains(T.CancelQuestion, bot.Telegram.SentMessages.Single(m => m.Chat == 10 && m.Id == actionsId).Text);
+        await bot.Router.Handle(BotFixture.Callback(10, actionsId, new("no", session.ListingId, session.Nonce)), Ct);
+        session = (await bot.Sessions.Get(10, SessionMode.Author, Ct))!;
+        Assert.Empty(session.ProductMessageIds);
+        Assert.Equal(actionsId, session.BuilderMessageId);
+        Assert.DoesNotContain(bot.Telegram.Deleted, message => message.Chat == 10 && message.Id == actionsId);
+    }
+
+    [Fact]
+    public async Task ExistingEmptyPlaceholderIsRemovedWhenTheDraftIsRenderedAgain()
+    {
+        using var bot = new BotFixture();
+        var listing = new Listing { AuthorUserId = 10, AuthorName = "Автор", AuthorUsername = "author" };
+        var placeholderId = await bot.Telegram.SendText(10, "📝 Ваше оголошення\nТут з’являтиметься інформація, яку ви додасте.", null, Ct);
+        var actionsId = await bot.Telegram.SendText(10, T.CategoryPrompt, null, Ct);
+        var session = new BuilderSession
+        {
+            UserId = 10, ListingId = listing.Id, CurrentStepId = "category", BuilderMessageId = actionsId,
+            ProductMessageIds = [placeholderId], LastProductHash = "old-placeholder", ReplyKeyboardHidden = true
+        };
+        await bot.Ui.Render(session, listing, Ct);
+        Assert.Empty(session.ProductMessageIds);
+        Assert.Contains(bot.Telegram.Deleted, message => message.Chat == 10 && message.Id == placeholderId);
+        Assert.Equal(actionsId, session.BuilderMessageId);
+        await bot.Ui.Render(session, listing, Ct);
+        Assert.Empty(session.ProductMessageIds);
+        Assert.Equal(actionsId, session.BuilderMessageId);
+    }
+
+    [Fact]
+    public async Task UneditableActionsFromAnInterruptedOlderBuildAreReplacedAndDeleted()
+    {
+        using var bot = new BotFixture();
+        var listing = new Listing { AuthorUserId = 10, AuthorName = "Автор" };
+        var oldActions = await bot.Telegram.SendText(10, T.BuilderHeader, new ReplyKeyboardRemove(), Ct);
+        var session = new BuilderSession
+        {
+            UserId = 10, ListingId = listing.Id, CurrentStepId = "category", BuilderMessageId = oldActions,
+            LayoutVersion = 1, ReplyKeyboardHidden = true
+        };
+        await bot.Ui.Render(session, listing, Ct);
+        Assert.NotEqual(oldActions, session.BuilderMessageId);
+        Assert.Contains(bot.Telegram.Deleted, message => message.Chat == 10 && message.Id == oldActions);
+        Assert.Single(bot.Telegram.SentMessages, message => message.Chat == 10 &&
+            message.Text?.StartsWith(T.BuilderHeader, StringComparison.Ordinal) == true &&
+            !bot.Telegram.Deleted.Contains((10, message.Id)));
     }
 
     [Fact]

@@ -1,4 +1,3 @@
-using System.Text.RegularExpressions;
 using BuySellBot.Domain;
 using BuySellBot.Infrastructure;
 using T = BuySellBot.Texts.Texts;
@@ -21,13 +20,13 @@ public sealed class StepCatalog
             new("title", _ => T.TitleLabel, _ => T.TitlePrompt, false, _ => false,
                 (l, _, i) => SetText(i.Text, 3, 60, T.TitleError, value => l.Title = value),
                 l => l.Title = "", _ => []),
-            new("condition", _ => T.ConditionLabel, l => l.Intent switch { Intent.Buy => T.ConditionBuyPrompt, Intent.Sell => T.ConditionSellPrompt, _ => T.SharedConditionPrompt }, true, _ => false,
+            new("condition", _ => T.ConditionLabel, _ => T.SharedConditionPrompt, true, _ => false,
                 (l, _, i) =>
                 {
                     if (!int.TryParse(i.Arg, out var index) || index < 0 || index >= T.Conditions.Length) return new(false, T.InvalidInput);
                     l.Condition = T.Conditions[index]; return new(true);
                 }, l => l.Condition = null, _ => T.Conditions.Select((c, n) => new StepChoice(c, n.ToString())).ToArray()),
-            new("price", l => l.Intent switch { Intent.Buy => T.BudgetLabel, Intent.Sell => T.PriceLabel, _ => T.PriceOrBudgetLabel }, l => l.Intent switch { Intent.Buy => T.BudgetPrompt, Intent.Sell => T.PricePrompt, _ => T.SharedPricePrompt }, false, _ => false,
+            new("price", _ => T.PriceOrBudgetLabel, _ => T.SharedPricePrompt, false, _ => false,
                 (l, s, i) =>
                 {
                     if (i.Arg is "UAH" or "USD" or "EUR")
@@ -38,25 +37,21 @@ public sealed class StepCatalog
                     }
                     if (i.Arg is "neg" or "free" or "ex")
                     {
-                        if (i.Arg == "free" && l.Intent == Intent.Buy) return new(false, T.PriceError);
                         l.Price = new(i.Arg switch { "free" => PriceKind.Free, "ex" => PriceKind.Exchange, _ => PriceKind.Negotiable }, Currency: s.Currency);
                         return new(true);
                     }
-                    if (!PriceParser.TryParse(i.Text, l.Intent, s.Currency, out var price)) return new(false, T.PriceError);
+                    if (!PriceParser.TryParse(i.Text, s.Currency, out var price)) return new(false, T.PriceError);
                     l.Price = price; s.Currency = price!.Currency; return new(true);
-                }, l => l.Price = null, l => l.Intent != Intent.Buy
-                    ? [new(T.Negotiable, "neg"), new(T.Free, "free"), new(T.Exchange, "ex")]
-                    : [new(T.Negotiable, "neg"), new(T.Exchange, "ex")]),
+                }, l => l.Price = null, _ => [new(T.Negotiable, "neg"), new(T.Free, "free"), new(T.Exchange, "ex")]),
             new("photos", _ => T.PhotosLabel, _ => T.PhotoPrompt, true, _ => false,
                 (l, _, i) =>
                 {
-                    if (i.Arg == "done") return new(true);
-                    if (i.Arg == "remove") { if (l.Photos.Count > 0) l.Photos.RemoveAt(l.Photos.Count - 1); return new(false); }
+                    if (i.Arg == "done" && l.Photos.Count > 0) return new(true);
                     if (i.Photo is null) return new(false, T.PhotoExpected);
                     if (l.Photos.Any(p => p.FileUniqueId == i.Photo.FileUniqueId)) return new(false);
                     if (l.Photos.Count >= 10) return new(false, T.PhotoLimit);
-                    l.Photos.Add(i.Photo); return new(false);
-                }, l => l.Photos.Clear(), _ => [new(T.PhotoDone, "done"), new(T.PhotoRemove, "remove")]),
+                    l.Photos.Add(i.Photo); return new(l.Photos.Count == 10);
+                }, l => l.Photos.Clear(), l => l.Photos.Count is > 0 and < 10 ? [new(T.PhotoDone, "done")] : []),
             new("location", _ => T.LocationLabel, _ => T.LocationPrompt, false, _ => false,
                 (l, _, i) =>
                 {
@@ -71,17 +66,23 @@ public sealed class StepCatalog
                 (l, s, i) =>
                 {
                     if (s.Mode != SessionMode.Author || s.UserId != l.AuthorUserId) return new(false, T.ContactConsentRequired);
-                    if (i.Arg == "telegram")
+                    if (i.Arg == "share")
                     {
-                        l.ContactKind = ContactKind.Telegram; l.ContactPhone = null; return new(true);
+                        var hasUsername = !string.IsNullOrWhiteSpace(l.AuthorUsername);
+                        var hasPhone = UkrainianPhoneParser.TryParse(l.ContactPhone, out var savedPhone);
+                        if (!hasUsername && !hasPhone) return new(false, T.ContactError);
+                        l.ContactPhone = savedPhone;
+                        l.ContactKind = hasUsername && hasPhone ? ContactKind.TelegramAndPhone
+                            : hasUsername ? ContactKind.Telegram : ContactKind.Phone;
+                        return new(true);
                     }
-                    if (i.Arg == "phone") { s.ContactPhoneRequested = true; return new(false); }
                     if (i.Arg is not null) return new(false, T.ContactError);
                     if (i.ContactOwner is not null && i.ContactOwner != l.AuthorUserId) return new(false, T.ContactError);
-                    var number = Regex.Replace(i.Text ?? "", @"[\s().-]", "");
-                    if (!Regex.IsMatch(number, @"^\+?[0-9]{7,15}$")) return new(false, T.ContactError);
+                    if (!UkrainianPhoneParser.TryParse(i.Text, out var number)) return new(false, T.ContactError);
                     l.ContactPhone = number; l.ContactKind = ContactKind.Phone; return new(true);
-                }, l => { l.ContactPhone = null; l.ContactKind = null; }, _ => [new(T.UseTelegram, "telegram"), new(T.EnterPhone, "phone")])
+                }, l => { l.ContactPhone = null; l.ContactKind = null; }, l =>
+                    !string.IsNullOrWhiteSpace(l.AuthorUsername) || UkrainianPhoneParser.TryParse(l.ContactPhone, out _)
+                        ? [new(T.ShareContact, "share")] : [])
         ];
     }
     private static StepResult SetText(string? raw, int min, int max, string error, Action<string> assign)

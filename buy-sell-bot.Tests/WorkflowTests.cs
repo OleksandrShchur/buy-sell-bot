@@ -10,11 +10,13 @@ namespace BuySellBot.Tests;
 public sealed class WorkflowTests
 {
     private static CancellationToken Ct => CancellationToken.None;
-    [Fact]
-    public async Task AuthorCompletesBuilderSubmitsAndAdminPublishesExactlyOnce()
+    [Theory]
+    [InlineData(Intent.Buy, "#купівля")]
+    [InlineData(Intent.Sell, "#продаж")]
+    public async Task AuthorCompletesBuilderSubmitsAndAdminPublishesExactlyOnce(Intent intent, string tag)
     {
         using var bot = new BotFixture();
-        await bot.Router.Handle(BotFixture.Message(10, T.Sell), Ct);
+        await bot.Router.Handle(BotFixture.Message(10, intent == Intent.Buy ? T.Buy : T.Sell), Ct);
         async Task Click(string action, string arg = "")
         {
             var session = (await bot.Sessions.Get(10, SessionMode.Author, Ct))!;
@@ -28,11 +30,14 @@ public sealed class WorkflowTests
         await Click("skip");
         await bot.Router.Handle(BotFixture.Message(10, "Київ"), Ct);
         await Click("skip");
-        await Click("choose", "telegram");
+        await Click("choose", "share");
         var review = (await bot.Sessions.Get(10, SessionMode.Author, Ct))!;
         Assert.Equal(FlowEngine.Review, review.CurrentStepId);
         await Click("submit");
         Assert.Null(await bot.Sessions.Get(10, SessionMode.Author, Ct));
+        var submitted = bot.Telegram.SentMessages.Single(message => message.Chat == 10 && message.Text == T.Submitted);
+        var menu = Assert.IsType<ReplyKeyboardMarkup>(submitted.Keyboard);
+        Assert.Equal(new[] { T.Buy, T.Sell }, menu.Keyboard.SelectMany(row => row).Select(button => button.Text));
         var pending = (await bot.Listings.Get(review.ListingId, Ct))!;
         Assert.Equal(ListingStatus.PendingApproval, pending.Status);
         Assert.Equal(2, pending.ModerationCards.Count);
@@ -43,7 +48,9 @@ public sealed class WorkflowTests
         await Task.WhenAll(bot.Router.Handle(first, Ct), bot.Router.Handle(second, Ct));
         var published = (await bot.Listings.Get(pending.Id, Ct))!;
         Assert.Equal(ListingStatus.Published, published.Status);
+        Assert.Equal(intent, published.Intent);
         Assert.Single(bot.Telegram.SentMessages, m => m.Thread == 42);
+        Assert.StartsWith(tag + " ", bot.Telegram.SentMessages.Single(m => m.Thread == 42).Text);
         Assert.True(published.AuthorNotified);
         Assert.Contains(bot.Telegram.Answers, a => a.Text == T.Stale);
         Assert.All(published.ModerationCards, card =>
@@ -115,6 +122,8 @@ public sealed class WorkflowTests
         Assert.Null(await bot.Sessions.Get(100, SessionMode.Moderator, Ct));
         Assert.Equal(own.ListingId, (await bot.Sessions.Get(100, SessionMode.Author, Ct))!.ListingId);
         Assert.Equal(ModerationOperation.None, (await bot.Listings.Get(listing.Id, Ct))!.Operation);
+        var cancelled = bot.Telegram.SentMessages.Single(message => message.Chat == 100 && message.Text == T.EditCancelled);
+        Assert.IsType<ReplyKeyboardMarkup>(cancelled.Keyboard);
     }
 
     [Fact]

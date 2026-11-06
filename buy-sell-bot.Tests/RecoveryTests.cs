@@ -72,8 +72,8 @@ public sealed class RecoveryTests
         var session = new BuilderSession();
         bot.Engine.CompleteAll(session);
         bot.Engine.Change(session, listing, "photos");
-        bot.Engine.Apply(session, listing, new(Arg: "remove"));
-        Assert.Empty(listing.Photos);
+        bot.Engine.Apply(session, listing, new(Photo: new("file2", "unique2")));
+        Assert.Equal(2, listing.Photos.Count);
         bot.Engine.Keep(session, listing);
         Assert.Single(listing.Photos);
         bot.Engine.Change(session, listing, "price");
@@ -117,6 +117,9 @@ public sealed class RecoveryTests
         Assert.Equal(ListingStatus.Published, published.Status);
         Assert.Equal("Уточнена назва", published.Title);
         Assert.True(published.EditedByModerator);
+        var confirmation = bot.Telegram.SentMessages.Single(message => message.Chat == 100 && message.Text == T.PublishedStatus);
+        var menu = Assert.IsType<Telegram.Bot.Types.ReplyMarkups.ReplyKeyboardMarkup>(confirmation.Keyboard);
+        Assert.Equal(new[] { T.Buy, T.Sell }, menu.Keyboard.SelectMany(row => row).Select(button => button.Text));
         Assert.Contains(bot.Telegram.SentMessages, m => m.Chat == 10 && m.Text == T.AuthorPublished(true));
     }
 

@@ -24,21 +24,29 @@ public sealed class FakeTelegram : ITelegramGateway
     public List<(long Chat, int Count, string? Caption)> PhotoSends { get; } = [];
     public ReplyMarkup? LastReplyKeyboard { get; private set; }
     public HashSet<int> MissingMessageIds { get; } = [];
+    public HashSet<int> HiddenMessageIds { get; } = [];
+    public Exception? SendFailure { get; set; }
+    public List<string> Operations { get; } = [];
+    private readonly HashSet<int> nonEditableMessages = [];
     public Exception? PublishFailure { get; set; }
     private int nextId;
     public int EditCount { get; private set; }
     public Task<int> SendText(long chatId, string text, ReplyMarkup? keyboard, CancellationToken ct, int? threadId = null)
     {
+        if (SendFailure is not null) throw SendFailure;
         if (threadId is not null && PublishFailure is not null) throw PublishFailure;
         var id = Interlocked.Increment(ref nextId);
         if (keyboard is ReplyKeyboardMarkup or ReplyKeyboardRemove) LastReplyKeyboard = keyboard;
+        if (keyboard is ReplyKeyboardMarkup or ReplyKeyboardRemove) nonEditableMessages.Add(id);
         SentMessages.Add(new(chatId, id, text, keyboard, threadId, 0));
+        Operations.Add("send:" + id);
         return Task.FromResult(id);
     }
     public Task<int> EditText(long chatId, int? messageId, string text, InlineKeyboardMarkup? keyboard, CancellationToken ct)
     {
         EditCount++;
         if (messageId is null) return SendText(chatId, text, keyboard, ct);
+        if (nonEditableMessages.Contains(messageId.Value) || MissingMessageIds.Contains(messageId.Value)) return SendText(chatId, text, keyboard, ct);
         SentMessages.RemoveAll(m => m.Chat == chatId && m.Id == messageId);
         SentMessages.Add(new(chatId, messageId.Value, text, keyboard, null, 0));
         return Task.FromResult(messageId.Value);
@@ -46,14 +54,19 @@ public sealed class FakeTelegram : ITelegramGateway
     public Task<IReadOnlyList<int>> SendPhotos(long chatId, IReadOnlyList<ListingPhoto> photos, string? caption, CancellationToken ct, int? threadId = null)
     {
         if (threadId is not null && PublishFailure is not null) throw PublishFailure;
+        if (SendFailure is not null) throw SendFailure;
         PhotoSends.Add((chatId, photos.Count, caption));
         var ids = photos.Select(_ => Interlocked.Increment(ref nextId)).ToArray();
-        foreach (var (id, index) in ids.Select((id, index) => (id, index))) SentMessages.Add(new(chatId, id, index == 0 ? caption : null, null, threadId, photos.Count));
+        foreach (var (id, index) in ids.Select((id, index) => (id, index)))
+        {
+            SentMessages.Add(new(chatId, id, index == 0 ? caption : null, null, threadId, photos.Count));
+            Operations.Add("send:" + id);
+        }
         return Task.FromResult<IReadOnlyList<int>>(ids);
     }
     public Task<int?> EditCaption(long chatId, int messageId, string caption, CancellationToken ct)
     {
-        if (MissingMessageIds.Contains(messageId)) return Task.FromResult<int?>(null);
+        if (MissingMessageIds.Contains(messageId) || nonEditableMessages.Contains(messageId)) return Task.FromResult<int?>(null);
         CaptionEdits.Add((chatId, messageId, caption));
         var message = SentMessages.Single(m => m.Chat == chatId && m.Id == messageId);
         SentMessages.Remove(message);
@@ -62,14 +75,19 @@ public sealed class FakeTelegram : ITelegramGateway
     }
     public Task<int?> EditPhoto(long chatId, int messageId, ListingPhoto photo, string caption, CancellationToken ct)
     {
-        if (MissingMessageIds.Contains(messageId)) return Task.FromResult<int?>(null);
+        if (MissingMessageIds.Contains(messageId) || nonEditableMessages.Contains(messageId)) return Task.FromResult<int?>(null);
         PhotoEdits.Add((chatId, messageId, photo.FileId));
         var message = SentMessages.Single(m => m.Chat == chatId && m.Id == messageId);
         SentMessages.Remove(message);
         SentMessages.Add(message with { Text = caption, PhotoCount = Math.Max(1, message.PhotoCount), Keyboard = null });
         return Task.FromResult<int?>(messageId);
     }
-    public Task Delete(long chatId, int messageId, CancellationToken ct) { Deleted.Add((chatId, messageId)); return Task.CompletedTask; }
+    public Task Delete(long chatId, int messageId, CancellationToken ct)
+    {
+        Deleted.Add((chatId, messageId));
+        Operations.Add("delete:" + messageId);
+        return Task.CompletedTask;
+    }
     public Task Answer(string callbackId, string? text, CancellationToken ct) { Answers.Add((callbackId, text)); return Task.CompletedTask; }
     public async Task<bool> Notify(long chatId, string text, ReplyMarkup? keyboard, CancellationToken ct) { await SendText(chatId, text, keyboard, ct); return true; }
     public Task Configure(CancellationToken ct) => Task.CompletedTask;
@@ -103,9 +121,9 @@ public sealed class BotFixture : IDisposable
         var storage = Microsoft.Extensions.Options.Options.Create(new StorageOptions { Path = DirectoryPath });
         Listings = new JsonListingRepository(storage); Sessions = new JsonSessionRepository(storage);
         Engine = new(new StepCatalog(Catalog)); Formatter = new(Catalog);
-        Ui = new(Telegram, new(Engine, Formatter), Sessions);
+        Ui = new(Telegram, new(Engine, Formatter), Sessions, NullLogger<BuilderUi>.Instance);
         Publisher = new(Telegram, Listings, Formatter, Catalog, Options, NullLogger<Publisher>.Instance);
-        Moderation = new(Telegram, Listings, Sessions, Publisher, Formatter, Catalog, Engine, Ui, Options, NullLogger<ModerationService>.Instance);
+        Moderation = new(Telegram, Listings, Sessions, Publisher, Formatter, Catalog, Engine, Ui, Locks, Options, NullLogger<ModerationService>.Instance);
         Photos = new PhotoDebouncer(new(), Locks, Sessions, Listings, Ui, NullLogger<PhotoDebouncer>.Instance);
         Router = new(Telegram, Listings, Sessions, Locks, Engine, Ui, Formatter, Moderation, Photos, Options);
     }
@@ -122,11 +140,11 @@ public sealed class BotFixture : IDisposable
             Chat = new() { Id = userId, Type = ChatType.Private }, Text = text
         }
     };
-    public static Update Callback(long userId, int messageId, CallbackData data) => new()
+    public static Update Callback(long userId, int messageId, CallbackData data, string? username = "author") => new()
     {
         Id = Random.Shared.Next(1, int.MaxValue), CallbackQuery = new()
         {
-            Id = Guid.NewGuid().ToString("N"), From = new() { Id = userId, FirstName = "Автор" }, Data = data.ToString(),
+            Id = Guid.NewGuid().ToString("N"), From = new() { Id = userId, FirstName = "Автор", Username = username }, Data = data.ToString(),
             ChatInstance = "test", Message = new() { Id = messageId, Chat = new() { Id = userId, Type = ChatType.Private } }
         }
     };

@@ -38,7 +38,6 @@ public sealed class FlowEngine(StepCatalog catalog)
     private void Advance(BuilderSession session, Listing listing)
     {
         session.CompletedSteps.Add(session.CurrentStepId);
-        session.ContactPhoneRequested = false;
         if (session.ChangeMode)
         {
             session.ChangeMode = false;
@@ -78,7 +77,6 @@ public sealed class FlowEngine(StepCatalog catalog)
         var step = Steps.FirstOrDefault(s => s.Id == id);
         if (step is null || step.AutoComplete(listing) || session.Mode == SessionMode.Moderator && id == "contact") return false;
         session.Invalidate();
-        session.ContactPhoneRequested = false;
         session.ChangeSnapshot = JsonSerializer.Deserialize<Listing>(
             JsonSerializer.Serialize(listing, JsonFileStore<Listing>.Json), JsonFileStore<Listing>.Json);
         session.CurrentStepId = id;
@@ -101,7 +99,6 @@ public sealed class FlowEngine(StepCatalog catalog)
             session.Currency = original.Price?.Currency ?? Currency.UAH;
         }
         session.ChangeSnapshot = null;
-        session.ContactPhoneRequested = false;
         session.Invalidate(); session.ChangeMode = false; session.CurrentStepId = Review;
     }
 }

@@ -19,6 +19,7 @@ public interface ISessionRepository
     Task Save(BuilderSession session, CancellationToken ct);
     Task Delete(long userId, SessionMode mode, CancellationToken ct);
     Task Activate(long userId, SessionMode mode, CancellationToken ct);
+    Task SaveContactPhone(long userId, string phone, CancellationToken ct);
 }
 
 public sealed class JsonListingRepository(IOptions<StorageOptions> options) : IListingRepository
@@ -64,6 +65,8 @@ public sealed class JsonSessionRepository(IOptions<StorageOptions> options) : IS
     }, ct);
     public Task Activate(long userId, SessionMode mode, CancellationToken ct) =>
         Mutate(userId, document => document.ActiveMode = mode, ct);
+    public Task SaveContactPhone(long userId, string phone, CancellationToken ct) =>
+        Mutate(userId, document => document.ContactPhone = phone, ct);
 }
 
 public sealed class ListingLocks

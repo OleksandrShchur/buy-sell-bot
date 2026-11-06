@@ -9,8 +9,35 @@ using T = BuySellBot.Texts.Texts;
 
 namespace BuySellBot.Bot;
 
-public sealed class BuilderUi(ITelegramGateway telegram, BuilderRenderer renderer, ISessionRepository sessions)
+public sealed class BuilderUi(ITelegramGateway telegram, BuilderRenderer renderer, ISessionRepository sessions, ILogger<BuilderUi> logger)
 {
+    private const int CurrentLayoutVersion = 1;
+    public async Task Refresh(BuilderSession session, Listing listing, CancellationToken ct, bool recreateProduct = false)
+    {
+        var previousIds = new List<int>();
+        if (session.BuilderMessageId is { } id) previousIds.Add(id);
+        session.BuilderMessageId = null;
+        session.LastRenderHash = null;
+        session.Nonce = BuilderSession.NewNonce();
+        if (recreateProduct)
+        {
+            previousIds.AddRange(session.ProductMessageIds);
+            previousIds.AddRange(session.ExtraMessageIds);
+            session.ProductMessageIds.Clear();
+            session.ProductPhotoIds.Clear();
+            session.ExtraMessageIds.Clear();
+            session.LastProductHash = null;
+            session.LayoutVersion = CurrentLayoutVersion;
+        }
+        // Recovery sends fresh UI instead of relying on a stale stored message id.
+        await Render(session, listing, ct);
+        logger.LogInformation("Restored builder for user {UserId}, listing {ListingId}, step {StepId}: new actions message {MessageId}",
+            session.UserId, session.ListingId, session.CurrentStepId, session.BuilderMessageId);
+        foreach (var previousId in previousIds.Distinct())
+            if (previousId != session.BuilderMessageId && !session.ProductMessageIds.Contains(previousId))
+                await telegram.Delete(session.UserId, previousId, ct);
+    }
+
     public async Task Cleanup(BuilderSession session, CancellationToken ct, bool keepPost = false)
     {
         if (session.BuilderMessageId is { } id) await telegram.Delete(session.UserId, id, ct);
@@ -31,13 +58,16 @@ public sealed class BuilderUi(ITelegramGateway telegram, BuilderRenderer rendere
     public async Task Render(BuilderSession session, Listing listing, CancellationToken ct)
     {
         // Upgrade sessions created by the old combined builder without touching their draft data.
-        if (session.ProductMessageIds.Count == 0 && session.LastProductHash is null)
+        if (session.LayoutVersion < CurrentLayoutVersion)
         {
-            if (session.BuilderMessageId is not null) await ResetActions(session, ct);
+            if (session.ProductMessageIds.Count == 0 && session.BuilderMessageId is not null)
+                await ResetActions(session, ct);
             foreach (var extra in session.ExtraMessageIds) await telegram.Delete(session.UserId, extra, ct);
             session.ExtraMessageIds.Clear();
+            session.LayoutVersion = CurrentLayoutVersion;
+            await sessions.Save(session, ct);
         }
-        if (session.ProductMessageIds.Count > 0 && !session.ReplyKeyboardHidden)
+        if (!session.ReplyKeyboardHidden)
             await HideReplyKeyboard(session, ct);
 
         var other = await sessions.Get(session.UserId, session.Mode == SessionMode.Author ? SessionMode.Moderator : SessionMode.Author, ct);
@@ -49,14 +79,29 @@ public sealed class BuilderUi(ITelegramGateway telegram, BuilderRenderer rendere
         var hash = Hash(view.ActionsText + JsonSerializer.Serialize(view.Keyboard));
         if (session.LastRenderHash != hash || session.BuilderMessageId is null)
         {
+            var oldActionsId = session.BuilderMessageId;
             session.BuilderMessageId = await telegram.EditText(session.UserId, session.BuilderMessageId, view.ActionsText, view.Keyboard, ct);
+            if (oldActionsId is { } oldId && oldId != session.BuilderMessageId)
+                await telegram.Delete(session.UserId, oldId, ct);
             session.LastRenderHash = hash;
         }
         await sessions.Save(session, ct);
     }
 
-    private async Task<bool> UpdateProduct(BuilderSession session, Listing listing, string text, CancellationToken ct)
+    private async Task<bool> UpdateProduct(BuilderSession session, Listing listing, string? text, CancellationToken ct)
     {
+        if (text is null)
+        {
+            if (session.ProductMessageIds.Count > 0)
+            {
+                foreach (var id in session.ProductMessageIds) await telegram.Delete(session.UserId, id, ct);
+                session.ProductMessageIds.Clear();
+                session.ProductPhotoIds.Clear();
+                session.LastProductHash = null;
+                await sessions.Save(session, ct);
+            }
+            return false;
+        }
         var photoIds = listing.Photos.Select(photo => photo.FileId).ToList();
         var hash = Hash(text);
         if (session.ProductMessageIds.Count == 0)
@@ -112,8 +157,7 @@ public sealed class BuilderUi(ITelegramGateway telegram, BuilderRenderer rendere
     {
         if (listing.Photos.Count == 0)
         {
-            session.ProductMessageIds = [await telegram.SendText(session.UserId, text, new ReplyKeyboardRemove(), ct)];
-            session.ReplyKeyboardHidden = true;
+            session.ProductMessageIds = [await telegram.SendText(session.UserId, text, null, ct)];
         }
         else
         {

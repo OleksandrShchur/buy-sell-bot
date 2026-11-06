@@ -8,7 +8,7 @@ public static partial class PriceParser
 {
     [GeneratedRegex(@"^\s*(?<a>\d+(?:[.,]\d{1,2})?)\s*(?:[-–—]\s*(?<b>\d+(?:[.,]\d{1,2})?))?\s*(?<c>грн|uah|usd|eur|₴|\$|€)?\s*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex Pattern();
-    public static bool TryParse(string? text, Intent intent, Currency currency, out Price? price)
+    public static bool TryParse(string? text, Currency currency, out Price? price)
     {
         price = null;
         if (string.IsNullOrWhiteSpace(text) || text.Length > 64) return false;
@@ -19,7 +19,7 @@ public static partial class PriceParser
         decimal? upper = null;
         if (match.Groups["b"].Success)
         {
-            if (intent == Intent.Sell || !Amount(match.Groups["b"].Value, out var parsed) || parsed < amount) return false;
+            if (!Amount(match.Groups["b"].Value, out var parsed) || parsed < amount) return false;
             upper = parsed;
         }
         currency = match.Groups["c"].Value.ToLowerInvariant() switch

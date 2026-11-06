@@ -1,7 +1,7 @@
 namespace BuySellBot.Domain;
 
 public enum Intent { Buy, Sell, BuyOrSell }
-public enum ContactKind { Telegram, Phone }
+public enum ContactKind { Telegram, Phone, TelegramAndPhone }
 public enum ListingStatus { Draft, PendingApproval, Published, Declined, Cancelled }
 public enum PriceKind { Fixed, Negotiable, Free, Exchange }
 public enum Currency { UAH, USD, EUR }
@@ -34,6 +34,7 @@ public sealed class Listing
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
     public long? ModeratorId { get; set; }
     public string? DeclineReason { get; set; }
+    public int? DeclineInputUpdateId { get; set; }
     public List<int> PublishedMessageIds { get; set; } = [];
     public List<ModerationCard> ModerationCards { get; set; } = [];
     public ModerationOperation Operation { get; set; }
@@ -67,7 +68,7 @@ public sealed class BuilderSession
     public List<string> ProductPhotoIds { get; set; } = [];
     public string? LastProductHash { get; set; }
     public bool ReplyKeyboardHidden { get; set; }
-    public bool ContactPhoneRequested { get; set; }
+    public int LayoutVersion { get; set; }
     public static string NewNonce() => Guid.NewGuid().ToString("N")[..8];
     public void Invalidate() { Nonce = NewNonce(); Warning = null; Confirmation = null; }
 }
@@ -75,6 +76,7 @@ public sealed class BuilderSession
 public sealed class SessionDocument
 {
     public long UserId { get; set; }
+    public string? ContactPhone { get; set; }
     public SessionMode ActiveMode { get; set; }
     public BuilderSession? Author { get; set; }
     public BuilderSession? Moderator { get; set; }

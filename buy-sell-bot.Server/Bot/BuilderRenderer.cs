@@ -6,16 +6,16 @@ using T = BuySellBot.Texts.Texts;
 
 namespace BuySellBot.Bot;
 
-public sealed record BuilderView(string ProductText, string ActionsText, InlineKeyboardMarkup Keyboard);
+public sealed record BuilderView(string? ProductText, string ActionsText, InlineKeyboardMarkup Keyboard);
 public sealed class BuilderRenderer(FlowEngine engine, PostFormatter formatter)
 {
-    public static ReplyKeyboardMarkup Menu => new(new KeyboardButton(T.CreateListing)) { ResizeKeyboard = true, OneTimeKeyboard = true };
+    public static ReplyKeyboardMarkup Menu => new(new[] { new[] { new KeyboardButton(T.Buy), new KeyboardButton(T.Sell) } }) { ResizeKeyboard = true, OneTimeKeyboard = true };
     public BuilderView Render(Listing listing, BuilderSession session, bool hasOtherSession = false)
     {
         var rows = new List<InlineKeyboardButton[]>();
         InlineKeyboardButton Button(string label, string action, string arg = "") =>
             InlineKeyboardButton.WithCallbackData(label, new CallbackData(action, listing.Id, session.Nonce, arg, session.Mode).ToString());
-        var preview = string.IsNullOrEmpty(listing.Title) && string.IsNullOrEmpty(listing.CategoryId) ? T.PostPlaceholder : formatter.Format(listing);
+        var preview = HasProductInformation(listing) ? formatter.Format(listing) : null;
         var progress = T.Progress(ProgressCalculator.CurrentStep(session, engine.Steps), engine.Steps.Count);
         string prompt;
         if (session.Confirmation is { } confirmation)
@@ -46,7 +46,7 @@ public sealed class BuilderRenderer(FlowEngine engine, PostFormatter formatter)
         {
             var step = engine.Current(session) ?? throw new InvalidOperationException("Unknown step.");
             prompt = step.Prompt(listing);
-            if (step.Id == "contact" && session.ContactPhoneRequested) prompt = T.PhonePrompt;
+            if (step.Id == "contact" && step.Choices(listing).Count == 0) prompt = T.ManualContactPrompt;
             foreach (var group in step.Choices(listing).Chunk(2))
                 rows.Add(group.Select(c => Button(c.Label, "choose", c.Argument)).ToArray());
             if (step.Id == "price")
@@ -62,4 +62,10 @@ public sealed class BuilderRenderer(FlowEngine engine, PostFormatter formatter)
         var count = session.CurrentStepId == "photos" && listing.Photos.Count > 0 ? "\n" + T.PhotoCount(listing.Photos.Count) : "";
         return new(preview, $"{T.BuilderHeader}\n{progress}\n\n{prompt}{count}{warning}", new(rows));
     }
+
+    private static bool HasProductInformation(Listing listing) =>
+        !string.IsNullOrWhiteSpace(listing.CategoryId) || !string.IsNullOrWhiteSpace(listing.Title) ||
+        !string.IsNullOrWhiteSpace(listing.Condition) || listing.Price is not null || listing.Photos.Count > 0 ||
+        !string.IsNullOrWhiteSpace(listing.Location) || !string.IsNullOrWhiteSpace(listing.Description) ||
+        listing.ContactKind is not null;
 }

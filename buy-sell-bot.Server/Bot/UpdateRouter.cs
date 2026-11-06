@@ -7,7 +7,6 @@ using BuySellBot.Storage;
 using Microsoft.Extensions.Options;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
-using Telegram.Bot.Types.ReplyMarkups;
 using T = BuySellBot.Texts.Texts;
 
 namespace BuySellBot.Bot;
@@ -28,6 +27,7 @@ public sealed class UpdateRouter(
                 await telegram.SendText(message.Chat.Id, T.Topic(message.Chat.Id, message.MessageThreadId), null, ct, message.MessageThreadId);
             return;
         }
+        var processed = true;
         try
         {
             if (command == "/help") { await telegram.SendText(user.Id, T.Help, null, ct); return; }
@@ -40,27 +40,43 @@ public sealed class UpdateRouter(
             {
                 await sessions.Activate(user.Id, SessionMode.Author, ct);
                 var author = await sessions.Get(user.Id, SessionMode.Author, ct);
-                if (author is not null) await Resume(author, ct);
-                else if (await sessions.Get(user.Id, SessionMode.Moderator, ct) is { } moderatorSession)
+                if (author is not null && await Resume(author, user, ct)) return;
+                if (await sessions.Get(user.Id, SessionMode.Moderator, ct) is { } moderatorSession)
                 {
                     await sessions.Activate(user.Id, SessionMode.Moderator, ct);
-                    await Resume(moderatorSession, ct);
+                    if (await Resume(moderatorSession, user, ct)) return;
                 }
-                else await telegram.SendText(user.Id, T.Welcome(options.Value.ChatUrl), BuilderRenderer.Menu, ct);
+                await sessions.Activate(user.Id, SessionMode.Author, ct);
+                await telegram.SendText(user.Id, T.Welcome(options.Value.ChatUrl), BuilderRenderer.Menu, ct);
                 return;
             }
-            if (message.Text == T.CreateListing || message.Text == T.Buy || message.Text == T.Sell)
+            if (message.Text == T.Buy || message.Text == "🛒 Куплю")
             {
-                await Start(user, Intent.BuyOrSell, ct); return;
+                await Start(user, Intent.Buy, ct); return;
             }
+            if (message.Text == T.Sell || message.Text == "💰 Продам")
+            {
+                await Start(user, Intent.Sell, ct); return;
+            }
+            if (message.Text == T.CreateListing)
+            {
+                await telegram.SendText(user.Id, T.ChooseIntent, BuilderRenderer.Menu, ct); return;
+            }
+            if (await moderation.TryHandleDeclineReason(update, ct)) return;
             var document = await sessions.GetDocument(user.Id, ct);
             var session = document.ActiveMode == SessionMode.Author ? document.Author : document.Moderator;
             session ??= document.Author ?? document.Moderator;
             if (session is null) { await telegram.SendText(user.Id, T.NoSession, BuilderRenderer.Menu, ct); return; }
             using var lease = await locks.Acquire(session.ListingId, ct);
             var listing = await listings.Get(session.ListingId, ct);
-            if (!Usable(session, listing)) { await Drop(session, ct); return; }
+            if (!Usable(session, listing))
+            {
+                await Drop(session, ct);
+                await telegram.SendText(user.Id, T.NoSession, BuilderRenderer.Menu, ct);
+                return;
+            }
             var working = session.Mode == SessionMode.Moderator ? session.WorkingCopy! : listing!;
+            await SyncAuthorContact(session, working, user, ct);
             if (session.AppliedInputIds.Contains(update.Id))
             {
                 await ui.Render(session, working, ct); return;
@@ -68,19 +84,31 @@ public sealed class UpdateRouter(
             if (command == "/cancel")
             {
                 session.Invalidate(); session.Confirmation = "cancel";
-                await ui.Render(session, working, ct); return;
+                await ui.Refresh(session, working, ct); return;
             }
             if (session.Confirmation is not null || session.CurrentStepId is FlowEngine.Review or FlowEngine.Changes)
             { session.Warning = T.InvalidInput; await ui.Render(session, working, ct); return; }
             var photo = message.Photo?.LastOrDefault();
             var isPhotoStep = session.CurrentStepId == "photos";
+            var isContactStep = session.CurrentStepId == "contact";
             var oldWarning = session.Warning;
+            // Telegram delivers each album photo as a separate update. A new upload
+            // replaces the selection; only items from the same album are accumulated.
+            if (photo is not null && isPhotoStep &&
+                (message.MediaGroupId is null || session.MediaGroupId != message.MediaGroupId))
+            {
+                working.Photos.Clear();
+                oldWarning = null;
+            }
             engine.Apply(session, working, new(
                 Text: message.Contact?.PhoneNumber ?? message.Text,
                 Photo: photo is null ? null : new(photo.FileId, photo.FileUniqueId),
                 ContactOwner: message.Contact is null ? null : message.Contact.UserId ?? -1));
             working.UpdatedAt = DateTimeOffset.UtcNow;
             if (session.Mode == SessionMode.Author) await listings.Save(working, ct);
+            if (isContactStep && session.Warning is null && working.ContactPhone is { } phone &&
+                working.ContactKind is ContactKind.Phone or ContactKind.TelegramAndPhone)
+                await sessions.SaveContactPhone(session.UserId, phone, ct);
             session.AppliedInputIds.Add(update.Id);
             if (session.AppliedInputIds.Count > 128) session.AppliedInputIds.RemoveAt(0);
             await sessions.Save(session, ct);
@@ -90,13 +118,19 @@ public sealed class UpdateRouter(
                 session.MediaGroupId = message.MediaGroupId;
                 session.PhotoBatchVersion++;
                 await sessions.Save(session, ct);
-                photos.Schedule(session);
+                if (session.CurrentStepId == "photos") photos.Schedule(session);
+                else await ui.Render(session, working, ct);
             }
             else await ui.Render(session, working, ct);
         }
+        catch
+        {
+            processed = false;
+            throw;
+        }
         finally
         {
-            if (options.Value.DeleteUserMessages) await telegram.Delete(message.Chat.Id, message.Id, ct);
+            if (processed && options.Value.DeleteUserMessages) await telegram.Delete(message.Chat.Id, message.Id, ct);
         }
     }
     private static bool Usable(BuilderSession session, Listing? listing) =>
@@ -110,18 +144,27 @@ public sealed class UpdateRouter(
         await ui.Cleanup(session, ct);
         await sessions.Delete(session.UserId, session.Mode, ct);
     }
-    private async Task Resume(BuilderSession session, CancellationToken ct)
+    private async Task SyncAuthorContact(BuilderSession session, Listing listing, User user, CancellationToken ct)
+    {
+        if (session.Mode != SessionMode.Author || listing.AuthorUserId != user.Id) return;
+        listing.AuthorUsername = user.Username;
+        listing.ContactPhone ??= (await sessions.GetDocument(user.Id, ct)).ContactPhone;
+    }
+    private async Task<bool> Resume(BuilderSession session, User user, CancellationToken ct)
     {
         using var lease = await locks.Acquire(session.ListingId, ct);
         var listing = await listings.Get(session.ListingId, ct);
-        if (!Usable(session, listing)) { await Drop(session, ct); return; }
+        if (!Usable(session, listing)) { await Drop(session, ct); return false; }
         var working = session.Mode == SessionMode.Moderator ? session.WorkingCopy! : listing!;
-        if (session.Mode == SessionMode.Author && working.ContactKind is null &&
+        await SyncAuthorContact(session, working, user, ct);
+        if (session.Mode == SessionMode.Author) await listings.Save(working, ct);
+        if (session.Mode == SessionMode.Author && (working.ContactKind is null || formatter.Validate(working) == T.ContactError) &&
             session.CurrentStepId is FlowEngine.Review or FlowEngine.Changes)
             engine.Change(session, working, "contact");
-        session.LastRenderHash = null;
-        session.ReplyKeyboardHidden = false;
-        await ui.Render(session, working, ct);
+        session.Invalidate();
+        session.RestartIntent = null;
+        await ui.Refresh(session, working, ct, recreateProduct: true);
+        return true;
     }
     private async Task Start(User user, Intent intent, CancellationToken ct)
     {
@@ -145,6 +188,7 @@ public sealed class UpdateRouter(
         var listing = new Listing { AuthorUserId = user.Id, AuthorUsername = user.Username,
             AuthorName = string.Join(' ', new[] { user.FirstName, user.LastName }.Where(s => !string.IsNullOrWhiteSpace(s))),
             Intent = intent };
+        listing.ContactPhone = (await sessions.GetDocument(user.Id, ct)).ContactPhone;
         if (listing.AuthorName.Length > 80) listing.AuthorName = listing.AuthorName[..80];
         // Collision check before creation; actors have serialized execution but ids are random.
         while (await listings.Get(listing.Id, ct) is not null) listing.Id = Guid.NewGuid().ToString("N")[..8];
@@ -204,6 +248,7 @@ public sealed class UpdateRouter(
             await Answer();
             await sessions.Activate(session.UserId, session.Mode, ct);
             var working = session.Mode == SessionMode.Moderator ? session.WorkingCopy! : listing;
+            await SyncAuthorContact(session, working, callback.From, ct);
             switch (data.Action)
             {
                 case "switch":
@@ -260,8 +305,7 @@ public sealed class UpdateRouter(
     {
         await Drop(session, ct);
         await moderation.Release(listing, ct);
-        var own = await sessions.Get(session.UserId, SessionMode.Author, ct);
-        await telegram.SendText(session.UserId, T.EditCancelled, own is null ? BuilderRenderer.Menu : new ReplyKeyboardRemove(), ct);
+        await telegram.SendText(session.UserId, T.EditCancelled, BuilderRenderer.Menu, ct);
     }
     private async Task Submit(Listing listing, BuilderSession session, CancellationToken ct)
     {
@@ -281,7 +325,7 @@ public sealed class UpdateRouter(
         await ui.Render(session, listing, ct);
         await ui.Cleanup(session, ct, keepPost: true);
         await sessions.Delete(session.UserId, session.Mode, ct);
-        await telegram.SendText(listing.AuthorUserId, T.Submitted, new ReplyKeyboardRemove(), ct);
+        await telegram.SendText(listing.AuthorUserId, T.Submitted, BuilderRenderer.Menu, ct);
         await moderation.Deliver(listing, ct);
     }
 }
